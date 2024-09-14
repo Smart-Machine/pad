@@ -46,7 +46,7 @@ The following points will be the primary responsibility of the API Gateway:
 
 For this reason, Golang was chosen. The build-in libraries, with a great coroutine schedule that offers "cheap" green threads, is the best pick for this kind of tasks.
 
-#### Service Discovery 
+#### Service Registry & Discovery 
 Following the same logic, and due to the constrains of the laboratory work, Golang is chosen, as the development language of it.
 
 #### Microservices
@@ -54,7 +54,12 @@ Due to the vast number of available libraries, and the nature of the deployment,
 
 * **Data Ingestion Microservice:** scrapy, pymongo, FastAPI, Playwright, grpcio, pika, prometheus_client; 
 * **Data Processing Microservice** schema, grpcio, prometheus_client, pytest; 
-* **Data Provider Microservice** FastAPI, websockets, SQLAlchemy, pika, prometheus_client; 
+* **Data Provider Microservice** FastAPI, websockets, SQLAlchemy, pika, prometheus_client. 
+
+#### Databases
+* **Redis** - used for caching in the API gateway;
+* **MongoDB** - used for storing unstructured data about stock prices from web, i.e. a temporary storage;
+* **PostgreSQL** - used for storing uniformly structured, validated data about stock prices.
 
 ### Data Management
 ---
@@ -69,8 +74,158 @@ The producer is the `Data Ingestion Microservice`. It consists primarly of the f
 
 #### Contracts
 
-**Service Discovery**
+**Service Registry & Discovery**
 
+_Register a Service_
+```json
+path: /services/:service-id
+method: POST
+{
+    name: "Service A",
+    ip_address: "10.0.x.x",
+    port_number: "8042",
+    protocol: "TCP"
+}
+```
+```json
+200 OK - success
+400 Bad Request - invalid payload
+```
 
+_Deregister a Service_
+```json
+path: /services/:service-id/:instance-id
+method: DELETE
+```
+```json
+204 No Content - sucess
+```
 
+_Fetch instance's list_
+```json
+path: /services/:service-id
+method: GET
+```
+```json
+status code: 200 OK
+content-type: application/json
 
+{
+  service_name: "Service A",
+  instance_count: 5,
+  registered_at: "2031-10-10T12:11:42Z",
+  instances: [
+    {
+      ip_address: "10.0.1.x",
+      port_number: "8042"
+    },
+    {...}
+  ]
+}
+```
+
+**Data Ingestion Microservice** 
+
+_Get list of sources_
+```json
+path: /sources
+method: GET
+```
+```json
+status code: 200 OK
+content-type: application/json
+
+{
+    "sources": ["https://www.alphavantage.co/", ...]
+}
+```
+
+**Data Provider Microservice**
+
+_Create session_
+```json
+path: /session
+method: POST
+
+{
+    "websocket_url": "ws://localhost:7890"
+}
+```
+```json
+200 OK - succes
+```
+
+* **Client side**
+
+_Connection and Subcription_
+```json
+{
+    "type": "subscribe",
+    "symbols": ["AAPL", "TSLA"]
+}
+```
+
+_Unsubscription_
+```json
+{
+    "type": "unsubscribe",
+    "symbols": ["AAPL"]
+}
+```
+
+* **Server Side**
+
+_Update client on stock prices_
+```json
+{
+    "type": "price_update",
+    "data": {
+        "AAPL": {
+        "price": 150.23,
+        "timestamp": "2024-09-14T12:34:56Z"
+        },
+        "TSLA": {
+            "price": 742.56,
+            "timestamp": "2024-09-14T12:34:56Z"
+        }
+    }
+}
+```
+
+_Notify user about error_
+```json
+{
+    "type": "error",
+    "message": "Invalid stock symbol: XYZ"
+}
+```
+
+**Data Processing Microservice**
+```proto
+syntax = "proto3";
+
+package dataprocessor;
+
+// The data processing service definition.
+service DataProcessor {
+  // Sends raw data to be processed
+  rpc ProcessData (RawData) returns (ProcessingResponse);
+}
+
+// The raw data message format
+message RawData {
+  string content = 1;
+}
+
+// The processing response message format
+message ProcessingResponse {
+  string status = 1;
+  string message = 2;
+}
+```
+_Note:_ This is the initial version of the `.proto` file, it might change.
+
+### Deployment
+---
+
+All the microservices, as well as the databases, and the message broker, will be containerized using `Docker`. For the microservices `Docker Compose` will be used to orchestrate their inner-dependencies. The Prometheus and Grafana stack will be deployed outside the project's core, acting as a third-party dependency. 
