@@ -31,7 +31,6 @@ allowing for faster iteration and continuous integration without downtime for th
 ![Architecture Overview](media/lab1-pad.drawio.png)
 
 * **Data Ingestion Microservice** -- gathering data about the stock prices from the web, or free APIs. 
-* **Data Processing Microservice** -- cleaning and structuring the data.
 * **Data Provider Microservice** -- creating a websocket connection with the client for quick updates.   
 
 ### Technology Stack 
@@ -52,8 +51,7 @@ Following the same logic, and due to the constrains of the laboratory work, Gola
 #### Microservices
 Due to the vast number of available libraries, and the nature of the deployment, Python is chosen. For each microservice the following frameworks will be used:
 
-* **Data Ingestion Microservice:** scrapy, pymongo, FastAPI, Playwright, grpcio, pika, prometheus_client; 
-* **Data Processing Microservice** schema, grpcio, prometheus_client, pytest; 
+* **Data Ingestion Microservice:** scrapy, pymongo, FastAPI, Playwright, grpcio, pika, prometheus_client, schema, py_test; 
 * **Data Provider Microservice** FastAPI, websockets, SQLAlchemy, pika, prometheus_client. 
 
 #### Databases
@@ -69,7 +67,7 @@ When a client runs the application a websocket connect is created to facilitate 
 The producer is the `Data Ingestion Microservice`. It consists primarly of the following parts:
 1. **Ingestion** - a collection of scrapers or data miners are getting data from the web, about the current stocks prices;
 2. **Storing** - all the found raw data will be stored in the `MongoDB`. 
-3. **Transforming** - a step performed by the `Data Processing Microservice`, where the raw data from the web is converted based on a scheme and validated before being send back;
+3. **Transforming** - a step where the raw data from the web is converted based on a scheme and validated before being send back;
 4. **Producing** - the transformed data is send via a worker to the queue, it being the producer of the queue. 
 
 #### Contracts
@@ -200,7 +198,7 @@ _Notify user about error_
 }
 ```
 
-**Data Processing Microservice**
+**Proto File**
 ```proto
 syntax = "proto3";
 
