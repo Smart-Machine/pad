@@ -1,172 +1,37 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"gateway-consul/circuitbreaker"
+	"gateway-consul/constants"
+	"gateway-consul/loadbalancer"
+	"gateway-consul/monitor"
+	"gateway-consul/redisclient"
+	"gateway-consul/servicediscoveryclient"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/go-redis/redis/v8"
-	"github.com/sony/gobreaker"
 )
 
-const maxRetries = 3
-const rateLimitPerMinute = 10
-const criticalLoad = 60
-const cacheTTL = 60 * time.Second
-
-var (
-	index        uint64
-	requestCount int64
-	rdb          *redis.Client
-	cb           *gobreaker.CircuitBreaker
-	ctx          = context.Background()
-	httpClient   = &http.Client{
-		Timeout: 5 * time.Second, // Set the timeout duration (5 seconds in this case)
-	}
-)
-
-type ServiceResponse struct {
-	Services []string `json:"services"`
-}
-
-func initRedis() {
-	rdb = redis.NewClient(&redis.Options{
-		Addr: "redis:6379", // Redis is running in Docker
-	})
-}
-
-func initCircuitBreaker() {
-	settings := gobreaker.Settings{
-		Name:        "API Gateway Circuit Breaker",
-		MaxRequests: maxRetries,
-		Interval:    10 * 1e9, // 60 sec
-		Timeout:     5 * 1e9,  // 30 sec
-		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			log.Printf("Consecutive failures: %d\n", counts.ConsecutiveFailures)
-			return counts.ConsecutiveFailures > 3
-		},
-		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-			log.Printf("Circuit breaker state change: %s -> %s\n", from.String(), to.String())
-		},
-	}
-
-	cb = gobreaker.NewCircuitBreaker(settings)
-}
-
-func raiseAlert(serviceName string, load int64) {
-	log.Printf("ALERT: Service %s is under critical load! %d requests/second\n", serviceName, load)
-}
-
-func monitorServiceLoad(serviceName string) {
-	// Reset the request count every second
-	ticker := time.NewTicker(1 * time.Second)
-
-	go func() {
-		for range ticker.C {
-			// Get the current request count
-			currentCount := atomic.LoadInt64(&requestCount)
-
-			// Check if the load exceeds the critical threshold
-			if currentCount >= criticalLoad {
-				raiseAlert(serviceName, currentCount)
-			}
-
-			// Reset the request count for the next second
-			atomic.StoreInt64(&requestCount, 0)
-		}
-	}()
-}
-
-func rateLimit(clientIP string, limit int, window time.Duration) bool {
-	key := fmt.Sprintf("rate-limit:%s", clientIP)
-	count, err := rdb.Get(ctx, key).Int()
-
-	if err == redis.Nil {
-		// Key doesn't exist, create it with initial value and expiration
-		rdb.Set(ctx, key, 1, window)
-		return true
-	}
-
-	if err != nil {
-		log.Printf("Error accessing Redis: %v", err)
-		return false
-	}
-
-	if count >= limit {
-		// Rate limit exceeded
-		return false
-	}
-
-	// Increment the counter
-	rdb.Incr(ctx, key)
-	return true
-}
-
-// Cache responses in Redis with a given expiration
-func cacheResponse(key string, value string, expiration time.Duration) {
-	err := rdb.Set(ctx, key, value, expiration).Err()
-	if err != nil {
-		log.Printf("Failed to cache response: %v\n", err)
-	}
-}
-
-// Get cached response from Redis
-func getCachedResponse(key string) (string, bool) {
-	val, err := rdb.Get(ctx, key).Result()
-	if err == redis.Nil {
-		return "", false // Cache miss
-	} else if err != nil {
-		log.Printf("Failed to get cache: %v\n", err)
-		return "", false
-	}
-	return val, true // Cache hit
-}
-
-func discoverService(serviceName string) ([]string, error) {
-	url := fmt.Sprintf("http://service-discovery:8081/service/%s", serviceName)
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("could not connect to service discovery: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
-		return nil, fmt.Errorf("error from discovery service: %v", string(bodyBytes))
-	}
-
-	var serviceResponse ServiceResponse
-	err = json.NewDecoder(resp.Body).Decode(&serviceResponse)
-	if err != nil {
-		return nil, fmt.Errorf("could not decode response: %v", err)
-	}
-
-	return serviceResponse.Services, nil
-}
-
-func getNextService(services []string) string {
-	nextIndex := atomic.AddUint64(&index, 1)
-	return services[nextIndex%uint64(len(services))]
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second, // Set the timeout duration (5 seconds in this case)
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	clientIP := r.RemoteAddr
 
 	// Rate limit check
-	if !rateLimit(clientIP, rateLimitPerMinute, time.Minute) {
+	if !redisclient.RateLimit(clientIP, constants.RateLimitPerMinute, time.Minute) {
 		http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)
 		return
 	}
 
 	// Increment the request count
-	atomic.AddInt64(&requestCount, 1)
+	atomic.AddInt64(&monitor.RequestCount, 1)
 
 	// Determine which service to forward to based on the path
 	var serviceName string
@@ -184,7 +49,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	cacheKey := fmt.Sprintf("cache:%s", r.URL.Path)
 
 	// Check cache first
-	cachedResponse, isCached := getCachedResponse(cacheKey)
+	cachedResponse, isCached := redisclient.GetCachedResponse(cacheKey)
 	if isCached {
 		log.Printf("Cache hit for %s\n", r.URL.Path)
 		w.WriteHeader(http.StatusOK)
@@ -195,13 +60,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Cache miss for %s\n", r.URL.Path)
 
 	// Discover the target service using Consul
-	services, err := discoverService(serviceName)
+	services, err := servicediscoveryclient.DiscoverService(serviceName)
 	if err != nil || len(services) == 0 {
 		http.Error(w, "Service discovery failed", http.StatusServiceUnavailable)
 		return
 	}
 
-	target := getNextService(services)
+	target := loadbalancer.GetNextService(services)
 	proxyURL := fmt.Sprintf("http://%s%s", target, r.URL.Path)
 
 	// Retry logic: number of retries before failing
@@ -209,8 +74,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	var lastError error
 
-	for retries < maxRetries {
-		_, err = cb.Execute(func() (interface{}, error) {
+	for retries < constants.MaxRetries {
+		_, err = circuitbreaker.CB.Execute(func() (interface{}, error) {
 			// Forward the request to the microservice
 			resp, err := httpClient.Get(proxyURL)
 			if err != nil {
@@ -219,13 +84,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			defer resp.Body.Close()
 
 			// Copy the response back to the client
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				return nil, err
 			}
 
 			// Cache the response with a TTL of 60 seconds
-			cacheResponse(cacheKey, string(body), cacheTTL)
+			redisclient.CacheResponse(cacheKey, string(body), constants.CacheTTL)
 
 			// Return the response to the client
 			w.WriteHeader(resp.StatusCode)
@@ -250,7 +115,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("Retrying request (%d/%d) for %s due to error: %v\n", retries, maxRetries, serviceName, err)
+		log.Printf("Retrying request (%d/%d) for %s due to error: %v\n", retries, constants.MaxRetries, serviceName, err)
 	}
 
 	// After retries, return error if still failing
@@ -261,10 +126,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	initRedis()
-	initCircuitBreaker()
+	redisclient.InitRedis()
+	circuitbreaker.InitCircuitBreaker()
 
-	monitorServiceLoad("python-microservice")
+	monitor.MonitorServiceLoad("python-microservice")
 
 	http.HandleFunc("/", handleRequest)
 	log.Println("API Gateway running on port 8080")
