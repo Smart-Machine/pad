@@ -1,4 +1,4 @@
-#!/home/smart0machine/Projects/UNI/IV/PAD/lab2/pad/client/.venv/bin/python
+#!/home/smart0machine/Projects/UNI/IV/PAD/lab3/pad/client/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
